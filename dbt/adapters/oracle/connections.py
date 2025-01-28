@@ -17,6 +17,7 @@ Copyright (c) 2020, Vitor Avancini
 from typing import List, Optional, Tuple, Any, Dict, Union
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from dbt_common.dataclass_schema import dbtClassMixin
 import json
 import enum
 import time
@@ -24,10 +25,24 @@ import uuid
 import platform
 
 import dbt_common.exceptions
-from dbt.adapters.contracts.connection import AdapterResponse, Credentials
+from dbt.adapters.contracts.connection import (
+    AdapterResponse,
+    Credentials,
+    Connection,
+    Identifier,
+    ConnectionState,
+    LazyHandle,
+)
 from dbt.adapters.exceptions.connection import FailedToConnectError
 from dbt.adapters.sql import SQLConnectionManager
-from dbt.adapters.events.types import ConnectionUsed, SQLQuery, SQLCommit, SQLQueryStatus
+from dbt.adapters.events.types import (
+    ConnectionUsed,
+    SQLQuery,
+    SQLCommit,
+    SQLQueryStatus,
+    NewConnection,
+    ConnectionReused
+)
 from dbt.adapters.events.logging import AdapterLogger
 
 from dbt_common.events.functions import fire_event
@@ -73,6 +88,36 @@ class OracleConnectionMethod(enum.Enum):
     HOST = 1
     TNS = 2
     CONNECTION_STRING = 3
+
+
+class OracleConnection(Connection):
+    _proxy_user: Optional[str] = None
+
+    def __init__(
+        self,
+        type: Identifier,
+        name: Optional[str],
+        credentials: dbtClassMixin,
+        state: ConnectionState = ConnectionState.INIT,  # type: ignore
+        transaction_open: bool = False,
+        handle: Optional[Any] = None,
+        proxy_user: Optional[str] = None,
+    ) -> None:
+        self.type = type
+        self.name = name
+        self.state = state
+        self.credentials = credentials
+        self.transaction_open = transaction_open
+        self.handle = handle
+        self.proxy_user = proxy_user
+
+    @property
+    def proxy_user(self):
+        return self._proxy_user
+
+    @proxy_user.setter
+    def proxy_user(self, value):
+        self._proxy_user = value
 
 
 @dataclass
@@ -196,6 +241,80 @@ class OracleAdapterConnectionManager(SQLConnectionManager):
             "module": credentials.session_info.get("module", default_module)
         }
 
+    def get_if_exists(self) -> Optional[OracleConnection]:
+        return super().get_if_exists()
+
+    def set_connection_name(self, name: Optional[str] = None) -> OracleConnection:
+        """Called by 'acquire_connection' in BaseAdapter, which is called by
+        'connection_named'.
+        Creates a connection for this thread if one doesn't already
+        exist, and will rename an existing connection.
+        """
+
+        conn_name: str = "master" if name is None else name
+
+        # Get a connection for this thread
+        conn = self.get_if_exists()
+
+        t_user = (
+            self.profile.credentials.user
+            if self.profile and self.profile.credentials
+            else None
+        )
+        node_info = get_node_info()
+        t_node_schema = (
+            node_info.get("node_relation", {}).get("schema")
+            if isinstance(node_info, dict)
+            else None
+        )
+        proxy_user = (
+            None
+            if t_node_schema is None or t_user.lower() == t_node_schema.lower()
+            else f"{t_user}[{t_node_schema}]"
+        )
+
+        if conn:
+            if conn.name == conn_name and conn.state == "open" and conn.proxy_user == proxy_user:
+               # everything is the same, just return the connection
+               return conn
+
+            if conn.proxy_user != proxy_user:
+               # we cannot use the connection if the proxy user is different
+               self.clear_thread_connection()
+               self.release()
+               conn.state = "closed"
+               conn = None
+
+        if conn is None:
+            conn = OracleConnection(
+                type=Identifier(self.TYPE),
+                name=conn_name,
+                state=ConnectionState.INIT,  # type: ignore
+                transaction_open=False,
+                handle=None,
+                credentials=self.profile.credentials,
+                proxy_user=proxy_user,
+            )
+
+            conn.handle = LazyHandle(self.open)
+            self.set_thread_connection(conn)
+            fire_event(
+                NewConnection(
+                    conn_name=conn_name, conn_type=self.TYPE, node_info=get_node_info()
+                )
+            )
+        else:
+            if conn.state != "open":
+                conn.handle = LazyHandle(self.open)
+            if conn.name != conn_name:
+                orig_conn_name: str = conn.name or ""
+                conn.name = conn_name
+                fire_event(
+                    ConnectionReused(orig_conn_name=orig_conn_name, conn_name=conn_name)
+                )
+
+        return conn
+
     @classmethod
     def open(cls, connection):
         if connection.state == 'open':
@@ -208,6 +327,10 @@ class OracleAdapterConnectionManager(SQLConnectionManager):
         logger.debug(f"Attempting to connect using Oracle method: '{method}' "
                      f"and dsn: '{dsn}'")
 
+        username = (
+            credentials.user if connection.proxy_user is None else connection.proxy_user
+        )
+
         if credentials.password is None:
             logger.debug("Password not supplied. "
                          "Using external authentication")
@@ -217,7 +340,7 @@ class OracleAdapterConnectionManager(SQLConnectionManager):
             }
         else:
             conn_config = {
-                'user': credentials.user,
+                'user': username,
                 'password': credentials.password,
                 'dsn': dsn
             }
