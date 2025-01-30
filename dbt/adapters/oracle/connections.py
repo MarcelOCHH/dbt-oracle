@@ -165,6 +165,7 @@ class OracleAdapterCredentials(Credentials):
     # session info is stored in v$session for each dbt run
     session_info: Optional[Dict[str, str]] = field(default_factory=dict)
 
+    proxy_user_list: Optional[List[str]] = None
 
     _ALIASES = {
         'dbname': 'database',
@@ -274,23 +275,32 @@ class OracleAdapterConnectionManager(SQLConnectionManager):
             else None
         )
 
+        t_proxy_user_list = (
+            [string.lower() for string in self.profile.credentials.proxy_user_list]
+            if self.profile and self.profile.credentials.proxy_user_list
+            else None
+        )
+
         proxy_user = (
             None
-            if t_node_schema is None or t_relation_name is None or t_user.lower() == t_node_schema.lower()
+            if t_node_schema is None
+            or t_relation_name is None
+            or t_user.lower() == t_node_schema.lower()
+            or not t_node_schema.lower() in t_proxy_user_list
             else f"{t_user}[{t_node_schema}]"
         )
 
         if conn:
             if conn.name == conn_name and conn.state == "open" and conn.proxy_user == proxy_user:
-               # everything is the same, just return the connection
-               return conn
+                # everything is the same, just return the connection
+                return conn
 
             if conn.proxy_user != proxy_user:
-               # we cannot use the connection if the proxy user is different
-               self.clear_thread_connection()
-               self.release()
-               conn.state = "closed"
-               conn = None
+                # we cannot use the connection if the proxy user is different
+                self.clear_thread_connection()
+                self.release()
+                conn.state = "closed"
+                conn = None
 
         if conn is None:
             conn = OracleConnection(
