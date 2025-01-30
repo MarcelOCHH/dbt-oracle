@@ -267,9 +267,16 @@ class OracleAdapterConnectionManager(SQLConnectionManager):
             if isinstance(node_info, dict)
             else None
         )
+
+        t_relation_name = (
+            node_info.get("node_relation", {}).get("relation_name")
+            if isinstance(node_info, dict)
+            else None
+        )
+
         proxy_user = (
             None
-            if t_node_schema is None or t_user.lower() == t_node_schema.lower()
+            if t_node_schema is None or t_relation_name is None or t_user.lower() == t_node_schema.lower()
             else f"{t_user}[{t_node_schema}]"
         )
 
@@ -330,6 +337,8 @@ class OracleAdapterConnectionManager(SQLConnectionManager):
         username = (
             credentials.user if connection.proxy_user is None else connection.proxy_user
         )
+
+        logger.debug(f"User for open Connection is {username}")
 
         if credentials.password is None:
             logger.debug("Password not supplied. "
